@@ -7,7 +7,7 @@
 #
 # It performs the following steps:
 #   1. Creates a temporary build directory for dithered PNGs.
-#   2. Resizes, converts, and dithers source PNGs into the build directory.
+#   2. Analyzes image contrast and dynamically dithers source PNGs into the build directory.
 #   3. Compiles the build directory into a .pdx package.
 #   4. Extracts ONLY the compiled .pdi files from inside the .pdx package.
 #   5. Moves the .pdi files to a final, clean assets directory.
@@ -15,7 +15,7 @@
 #
 # USAGE:
 #   Place this script in a folder with your source PNG images and execute it.
-#   Requires: ImageMagick, and the Playdate SDK (for pdc).
+#   Requires: ImageMagick, the Playdate SDK (for pdc), and bc.
 #
 #-------------------------------------------------------------------------------
 
@@ -26,14 +26,19 @@ FINAL_ASSETS_DIR="__final_pdi_assets"
 # The name of the temporary directory for intermediate work.
 BUILD_DIR="__build_temp"
 
-# The percentage of pixels to saturate to black and white.
-# This increases contrast and prevents "muddy" dithering.
-# "0%" disables it. "1%" to "5%" is a good range to try.
-CONTRAST_AMOUNT="2%"
-
 # The maximum dimensions for the output images.
 # Images will be scaled down to fit within this box, preserving aspect ratio.
 MAX_DIMENSIONS="240x240"
+
+# --- Dynamic Contrast Configuration ---
+# The script will calculate contrast and apply a stretch between MAX and MIN.
+# Standard deviation is used as the measure of contrast.
+MAX_CONTRAST_STRETCH=5.0
+MIN_CONTRAST_STRETCH=0.0
+# Any image with std dev below this gets the MAX stretch.
+LOW_CONTRAST_THRESHOLD=0.1
+# Any image with std dev above this gets the MIN stretch.
+HIGH_CONTRAST_THRESHOLD=0.3
 
 
 # --- Safety Checks ---
@@ -43,30 +48,54 @@ set -eu
 # Check if required commands are installed.
 command -v magick >/dev/null 2>&1 || { echo "Error: ImageMagick is not installed. Aborting."; exit 1; }
 command -v pdc >/dev/null 2>&1 || { echo "Error: Playdate SDK (pdc) is not found in PATH. Aborting."; exit 1; }
+command -v bc >/dev/null 2>&1 || { echo "Error: bc (basic calculator) is not installed. Aborting."; exit 1; }
 
 
 # --- Main Script Logic ---
 
 echo "STEP 1/4: Preparing directories..."
-# Clean up any artifacts from previous runs.
 rm -rf "$BUILD_DIR" "${BUILD_DIR}.pdx" "$FINAL_ASSETS_DIR"
-
-# Create our temporary build folder and the final destination folder.
 mkdir "$BUILD_DIR" "$FINAL_ASSETS_DIR"
 
-echo "STEP 2/4: Resizing and Dithering PNGs..."
+echo "STEP 2/4: Analyzing, Resizing, and Dithering PNGs..."
 # Loop through all PNG files and place the dithered versions in the build directory.
 for file in ./*.png; do
   [ -f "$file" ] || continue
   filename=$(basename "$file")
-  echo "  -> Processing ${filename}"
 
-  # Convert the image and place the dithered version in the build directory.
-  # The resize operation happens first to ensure correct dimensions before dithering.
+  # --- Dynamic Contrast Calculation ---
+  # 1. Get the standard deviation of the grayscale image. This is our contrast metric.
+  #    We pipe to `head -n 1` to ensure we only get one value, even if magick
+  #    outputs the statistic for multiple channels.
+  STD_DEV=$(magick "$file" -grayscale Rec709Luminance -verbose info: | grep "standard deviation" | head -n 1 | awk -F'[()]' '{print $2}')
+
+  # 2. Decide the contrast amount based on the thresholds.
+  #    We use `bc` for float comparison and test if the output is 1 (true).
+  if [ "$(echo "$STD_DEV <= $LOW_CONTRAST_THRESHOLD" | bc -l)" -eq 1 ]; then
+    # Image has very low contrast, use the maximum stretch.
+    DYNAMIC_CONTRAST_AMOUNT="$MAX_CONTRAST_STRETCH"
+  elif [ "$(echo "$STD_DEV >= $HIGH_CONTRAST_THRESHOLD" | bc -l)" -eq 1 ]; then
+    # Image has high contrast, use the minimum stretch (effectively none).
+    DYNAMIC_CONTRAST_AMOUNT="$MIN_CONTRAST_STRETCH"
+  else
+    # Image contrast is in the middle range. We'll calculate a value that
+    # scales from MAX_STRETCH down to MIN_STRETCH as the STD_DEV increases.
+    # This is a simple linear interpolation.
+    RANGE=$(echo "$HIGH_CONTRAST_THRESHOLD - $LOW_CONTRAST_THRESHOLD" | bc -l)
+    DELTA=$(echo "$HIGH_CONTRAST_THRESHOLD - $STD_DEV" | bc -l)
+    STRETCH_RANGE=$(echo "$MAX_CONTRAST_STRETCH - $MIN_CONTRAST_STRETCH" | bc -l)
+    DYNAMIC_CONTRAST_AMOUNT=$(echo "($DELTA / $RANGE) * $STRETCH_RANGE + $MIN_CONTRAST_STRETCH" | bc -l)
+  fi
+
+  # Add a '%' to the final number for ImageMagick.
+  DYNAMIC_CONTRAST_AMOUNT="${DYNAMIC_CONTRAST_AMOUNT}%"
+  echo "  -> Processing ${filename} (StdDev: ${STD_DEV}, Stretch: ${DYNAMIC_CONTRAST_AMOUNT})"
+
+  # 3. Perform the conversion using the dynamically calculated value.
   magick "$file" \
     -resize "$MAX_DIMENSIONS" \
     -grayscale Rec709Luminance \
-    -contrast-stretch "$CONTRAST_AMOUNT" \
+    -contrast-stretch "$DYNAMIC_CONTRAST_AMOUNT" \
     -dither Ordered -ordered-dither o4x4 \
     -colors 2 \
     "${BUILD_DIR}/${filename}"
