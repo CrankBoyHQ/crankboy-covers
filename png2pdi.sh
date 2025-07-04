@@ -1,54 +1,126 @@
-#!/bin/sh
+#!/bin/bash
 #
-# Playdate Asset Compiler
+# Playdate Asset Compiler (Definitive Gamma-Correcting Version)
 #
-# This script converts a folder of PNG images into a clean directory
-# containing only the compiled Playdate image assets (.pdi files).
-#
-# It performs the following steps:
-#   1. Creates a temporary build directory for dithered PNGs.
-#   2. Analyzes image contrast and dynamically dithers source PNGs into the build directory.
-#   3. Compiles the build directory into a .pdx package.
-#   4. Extracts ONLY the compiled .pdi files from inside the .pdx package.
-#   5. Moves the .pdi files to a final, clean assets directory.
-#   6. Deletes all temporary build files and the .pdx package.
+# This script uses a single pass to intelligently diagnose and treat images.
+# It now uses Gamma Correction to properly rescue extremely dark images,
+# followed by local contrast enhancement for maximum detail.
 #
 # USAGE:
 #   Place this script in a folder with your source PNG images and execute it.
-#   Requires: ImageMagick, the Playdate SDK (for pdc), and bc.
+#   Requires: ImageMagick, the Playdate SDK (for pdc), and awk.
 #
 #-------------------------------------------------------------------------------
 
 # --- Configuration ---
-# The final, clean directory that will contain ONLY the compiled .pdi files.
 FINAL_ASSETS_DIR="__final_pdi_assets"
-
-# The name of the temporary directory for intermediate work.
 BUILD_DIR="__build_temp"
-
-# The maximum dimensions for the output images.
-# Images will be scaled down to fit within this box, preserving aspect ratio.
 MAX_DIMENSIONS="240x240"
 
-# --- Dynamic Contrast Configuration ---
-# The script will calculate contrast and apply a stretch between MAX and MIN.
-# Standard deviation is used as the measure of contrast.
-MAX_CONTRAST_STRETCH=5.0
-MIN_CONTRAST_STRETCH=0.0
-# Any image with std dev below this gets the MAX stretch.
-LOW_CONTRAST_THRESHOLD=0.1
-# Any image with std dev above this gets the MIN stretch.
-HIGH_CONTRAST_THRESHOLD=0.3
+# --- Layout-Aware Analysis ---
+# Ignores a percentage of the width from the left during analysis.
+# Set to 20 for Game Boy box art. Set to 0 to disable.
+IGNORE_LEFT_BANNER_PERCENT=20
 
+# --- Intelligent Thresholds ---
+# An image's artwork is "DARK" if its mean brightness is below this (0.0 to 1.0).
+DARK_IMAGE_MEAN_THRESHOLD=0.25
+# An image's artwork is "LOW CONTRAST" if its std dev is below this.
+LOW_CONTRAST_STD_DEV_THRESHOLD=0.15
+
+# --- Image Rescue Configuration ---
+# Gamma value for dark images. >1.0 brightens mid-tones. 1.8 is a strong lift.
+DARK_IMAGE_GAMMA_CORRECTION=1.8
+# Local contrast settings for both dark and low-contrast images.
+LOCAL_CONTRAST_RADIUS=10
+LOCAL_CONTRAST_STRENGTH=15 # As a percentage
+
+# --- Parallelism Configuration ---
+if [ -n "$(command -v nproc)" ]; then
+  NUM_CORES=$(nproc)
+else
+  NUM_CORES=$(sysctl -n hw.ncpu)
+fi
 
 # --- Safety Checks ---
-# Exit immediately if a command fails or if trying to use an unset variable.
-set -eu
-
-# Check if required commands are installed.
+set -u
 command -v magick >/dev/null 2>&1 || { echo "Error: ImageMagick is not installed. Aborting."; exit 1; }
 command -v pdc >/dev/null 2>&1 || { echo "Error: Playdate SDK (pdc) is not found in PATH. Aborting."; exit 1; }
-command -v bc >/dev/null 2>&1 || { echo "Error: bc (basic calculator) is not installed. Aborting."; exit 1; }
+command -v awk >/dev/null 2>&1 || { echo "Error: awk is not installed. Aborting."; exit 1; }
+
+
+# --- Image Processing Functions ---
+
+# Function to get both Mean and Standard Deviation in one pass.
+get_stats_and_path() {
+  filepath="$1"
+  local magick_cmd=("magick" "-quiet" "$filepath")
+  if (( IGNORE_LEFT_BANNER_PERCENT > 0 )); then
+    magick_cmd+=("-gravity" "West" "-chop" "${IGNORE_LEFT_BANNER_PERCENT}x0%")
+  fi
+  magick_cmd+=("-grayscale" "Rec709Luminance" "-verbose" "info:")
+  stats=$(LC_ALL=C "${magick_cmd[@]}" | LC_ALL=C awk -F'[()]' '/mean:|standard deviation:/ {print $2}')
+  if [ -n "$stats" ]; then
+    echo "$stats" | paste -d' ' - - | awk -v path="$filepath" '{print $1, $2, path}'
+  fi
+}
+
+# Function to process a single image based on its stats.
+process_image() {
+  mean=$1
+  std_dev=$2
+  shift 2
+  file="$*"
+
+  filename=$(basename "$file")
+
+  local magick_ops=()
+  local display_val_str=""
+
+  # The Definitive Logic Tree
+  if awk -v val="$mean" -v limit="$DARK_IMAGE_MEAN_THRESHOLD" 'BEGIN {exit !(val <= limit)}'; then
+    # Rule 1: Image is too dark. Apply a powerful gamma lift, then normalize,
+    # then enhance local contrast for maximum detail recovery.
+    magick_ops+=(-gamma "$DARK_IMAGE_GAMMA_CORRECTION" -normalize -local-contrast "${LOCAL_CONTRAST_RADIUS}x${LOCAL_CONTRAST_STRENGTH}%")
+    display_val_str="Dark Image Rescue"
+  elif awk -v val="$std_dev" -v limit="$LOW_CONTRAST_STD_DEV_THRESHOLD" 'BEGIN {exit !(val <= limit)}'; then
+    # Rule 2: Image is balanced but low contrast.
+    # A gentler normalize followed by local contrast is sufficient.
+    magick_ops+=(-normalize -local-contrast "${LOCAL_CONTRAST_RADIUS}x${LOCAL_CONTRAST_STRENGTH}%")
+    display_val_str="Local Enhance"
+  else
+    # Rule 3: Image is already good. Do nothing.
+    display_val_str="None"
+  fi
+
+  echo "  -> Processing ${filename} (Mean: ${mean}, StdDev: ${std_dev}, Method: ${display_val_str})"
+
+  full_magick_args=()
+  full_magick_args+=("$file")
+  full_magick_args+=(-resize "$MAX_DIMENSIONS")
+  full_magick_args+=(-grayscale "Rec709Luminance")
+  if [ ${#magick_ops[@]} -gt 0 ]; then
+    full_magick_args+=("${magick_ops[@]}")
+  fi
+  full_magick_args+=(-dither "Ordered" -ordered-dither "o4x4")
+  full_magick_args+=(-colors 2)
+  full_magick_args+=("${BUILD_DIR}/${filename}")
+
+  if magick -quiet "${full_magick_args[@]}"; then
+      touch "${BUILD_DIR}/${filename}.success"
+  else
+      echo "  🚨 WARNING: Failed to convert ${filename}. Check for ImageMagick errors above. Skipping."
+      touch "${BUILD_DIR}/${filename}.fail"
+  fi
+}
+
+# Functions and variables for use in parallel child processes.
+export -f get_stats_and_path
+export -f process_image
+export BUILD_DIR MAX_DIMENSIONS
+export IGNORE_LEFT_BANNER_PERCENT
+export DARK_IMAGE_MEAN_THRESHOLD LOW_CONTRAST_STD_DEV_THRESHOLD
+export DARK_IMAGE_GAMMA_CORRECTION LOCAL_CONTRAST_RADIUS LOCAL_CONTRAST_STRENGTH
 
 
 # --- Main Script Logic ---
@@ -57,68 +129,42 @@ echo "STEP 1/4: Preparing directories..."
 rm -rf "$BUILD_DIR" "${BUILD_DIR}.pdx" "$FINAL_ASSETS_DIR"
 mkdir "$BUILD_DIR" "$FINAL_ASSETS_DIR"
 
-echo "STEP 2/4: Analyzing, Resizing, and Dithering PNGs..."
-# Loop through all PNG files and place the dithered versions in the build directory.
-for file in ./*.png; do
-  [ -f "$file" ] || continue
-  filename=$(basename "$file")
+echo "STEP 2/4: Analyzing all images (ignoring left ${IGNORE_LEFT_BANNER_PERCENT}% of width)..."
+ANALYSIS_DATA=$(find . -maxdepth 1 -name '*.png' -print0 | xargs -0 -P "$NUM_CORES" -I {} bash -c 'get_stats_and_path "$@"' _ {})
 
-  # --- Dynamic Contrast Calculation ---
-  # 1. Get the standard deviation of the grayscale image. This is our contrast metric.
-  #    We pipe to `head -n 1` to ensure we only get one value, even if magick
-  #    outputs the statistic for multiple channels.
-  STD_DEV=$(magick "$file" -grayscale Rec709Luminance -verbose info: | grep "standard deviation" | head -n 1 | awk -F'[()]' '{print $2}')
+if [ -z "$ANALYSIS_DATA" ]; then
+    echo "No PNG files found to process. Exiting."
+    exit 0
+fi
 
-  # 2. Decide the contrast amount based on the thresholds.
-  #    We use `bc` for float comparison and test if the output is 1 (true).
-  if [ "$(echo "$STD_DEV <= $LOW_CONTRAST_THRESHOLD" | bc -l)" -eq 1 ]; then
-    # Image has very low contrast, use the maximum stretch.
-    DYNAMIC_CONTRAST_AMOUNT="$MAX_CONTRAST_STRETCH"
-  elif [ "$(echo "$STD_DEV >= $HIGH_CONTRAST_THRESHOLD" | bc -l)" -eq 1 ]; then
-    # Image has high contrast, use the minimum stretch (effectively none).
-    DYNAMIC_CONTRAST_AMOUNT="$MIN_CONTRAST_STRETCH"
-  else
-    # Image contrast is in the middle range. We'll calculate a value that
-    # scales from MAX_STRETCH down to MIN_STRETCH as the STD_DEV increases.
-    # This is a simple linear interpolation.
-    RANGE=$(echo "$HIGH_CONTRAST_THRESHOLD - $LOW_CONTRAST_THRESHOLD" | bc -l)
-    DELTA=$(echo "$HIGH_CONTRAST_THRESHOLD - $STD_DEV" | bc -l)
-    STRETCH_RANGE=$(echo "$MAX_CONTRAST_STRETCH - $MIN_CONTRAST_STRETCH" | bc -l)
-    DYNAMIC_CONTRAST_AMOUNT=$(echo "($DELTA / $RANGE) * $STRETCH_RANGE + $MIN_CONTRAST_STRETCH" | bc -l)
-  fi
+echo "STEP 3/4: Dithering PNGs in parallel using intelligent rules..."
 
-  # Add a '%' to the final number for ImageMagick.
-  DYNAMIC_CONTRAST_AMOUNT="${DYNAMIC_CONTRAST_AMOUNT}%"
-  echo "  -> Processing ${filename} (StdDev: ${STD_DEV}, Stretch: ${DYNAMIC_CONTRAST_AMOUNT})"
+job_count=0
+while read -r mean std_dev file; do
+    process_image "$mean" "$std_dev" "$file" &
+    job_count=$((job_count + 1))
+    if (( job_count >= NUM_CORES )); then
+        wait
+        job_count=0
+    fi
+done <<< "$ANALYSIS_DATA"
+wait
 
-  # 3. Perform the conversion using the dynamically calculated value.
-  magick "$file" \
-    -resize "$MAX_DIMENSIONS" \
-    -grayscale Rec709Luminance \
-    -contrast-stretch "$DYNAMIC_CONTRAST_AMOUNT" \
-    -dither Ordered -ordered-dither o4x4 \
-    -colors 2 \
-    "${BUILD_DIR}/${filename}"
-done
+SUCCESS_COUNT=$(find "$BUILD_DIR" -maxdepth 1 -name '*.success' | wc -l)
+FAIL_COUNT=$(find "$BUILD_DIR" -maxdepth 1 -name '*.fail' | wc -l)
 
-echo "STEP 3/4: Compiling assets into a .pdx package..."
-# Create a placeholder main.lua inside the build directory so pdc has a source.
+echo
+echo "STEP 3 COMPLETE: Processed ${SUCCESS_COUNT} images. Skipped ${FAIL_COUNT} files."
+
+echo "STEP 4/4: Compiling and finishing up..."
 touch "${BUILD_DIR}/main.lua"
-
-# Run pdc ON the build directory. This creates a new package: __build_temp.pdx
 pdc "${BUILD_DIR}"
-
-echo "STEP 4/4: Extracting compiled .pdi files from the package..."
-# Find all .pdi files inside the newly created .pdx directory and move them.
-# A .pdx is just a folder, so we can access its contents directly.
 find "${BUILD_DIR}.pdx" -name "*.pdi" -exec mv {} "$FINAL_ASSETS_DIR" \;
-
-echo "STEP 5/5: Cleaning up temporary files..."
-# Remove the intermediate build directory and the temporary .pdx package.
 rm -rf "$BUILD_DIR" "${BUILD_DIR}.pdx"
 
 echo
 echo "----------------------------------------------------"
 echo "✅ Success! Your clean asset folder is ready:"
 echo "    -> ${FINAL_ASSETS_DIR}/"
+echo "Processed: ${SUCCESS_COUNT} | Failed: ${FAIL_COUNT}"
 echo "----------------------------------------------------"
